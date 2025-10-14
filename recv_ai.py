@@ -3,6 +3,9 @@ import cv2, numpy as np
 import websockets
 from datetime import datetime
 from typing import Optional, Dict, Any
+from ultralytics import YOLO
+from pathlib import Path
+import threading
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Server configuration - MATCHES HOLOLENS CLIENT
@@ -21,6 +24,12 @@ MAX_FRAME_ID     = 1_000_000   # Reset frame counter at this point
 json_clients = set()
 video_clients = set()
 ai_detection_clients = set()
+
+# YOLO-World global variables
+yolo_model = None
+target_object = "person"  # default object to detect
+latest_frame = None
+latest_frame_lock = threading.Lock()
 
 # Setup logging
 logging.basicConfig(
@@ -67,6 +76,90 @@ class FrameStats:
         }
 
 # ──────────────────────────────────────────────────────────────────────────────
+def init_yolo_world():
+    """Initialize YOLO-World model for zero-shot detection"""
+    global yolo_model, target_object
+    try:
+        logger.info("Loading YOLO-World model...")
+        yolo_model = YOLO('yolov8s-world.pt')  # Download and load model
+        yolo_model.set_classes([target_object])  # Set initial target class
+        logger.info(f"YOLO-World model loaded successfully! Detecting: {target_object}")
+    except Exception as e:
+        logger.error(f"Failed to load YOLO-World model: {e}")
+        logger.error("Will fall back to random detections")
+
+def read_target_object():
+    """Read target object from text file"""
+    global target_object, yolo_model
+    try:
+        target_file = Path("target_object.txt")
+        if target_file.exists():
+            new_target = target_file.read_text().strip()
+            if new_target and new_target != target_object:
+                target_object = new_target
+                logger.info(f"Target object updated to: {target_object}")
+                # Update YOLO-World classes
+                if yolo_model:
+                    yolo_model.set_classes([target_object])
+                    logger.info(f"YOLO-World now detecting: {target_object}")
+    except Exception as e:
+        logger.warning(f"Error reading target object file: {e}")
+
+def run_yolo_detection() -> Dict[str, Any]:
+    """Run YOLO-World detection on latest frame from HoloLens"""
+    global latest_frame, yolo_model, target_object
+    
+    # Fallback to random detections if model not loaded or no frame available
+    if yolo_model is None or latest_frame is None:
+        return generate_random_detections()
+    
+    try:
+        # Read target object from file (check for updates)
+        read_target_object()
+        
+        # Run inference on the latest frame
+        with latest_frame_lock:
+            if latest_frame is None:
+                return {"detections": []}
+            frame = latest_frame.copy()
+        
+        results = yolo_model(frame, verbose=False, conf=0.3)  # 30% confidence threshold
+        
+        detections = []
+        if len(results) > 0 and results[0].boxes is not None:
+            boxes = results[0].boxes
+            h, w = frame.shape[:2]
+            
+            for i in range(len(boxes)):
+                box = boxes.xyxy[i].cpu().numpy()  # [x1, y1, x2, y2]
+                conf = float(boxes.conf[i].cpu().numpy())
+                
+                # Convert to normalized coordinates (0-1)
+                x1, y1, x2, y2 = box
+                x = x1 / w
+                y = y1 / h
+                width = (x2 - x1) / w
+                height = (y2 - y1) / h
+                
+                detections.append({
+                    "class": target_object,
+                    "confidence": round(conf, 3),
+                    "bbox": {
+                        "x": round(x, 3),
+                        "y": round(y, 3),
+                        "width": round(width, 3),
+                        "height": round(height, 3)
+                    }
+                })
+        
+        logger.debug(f"YOLO detected {len(detections)} {target_object}(s)")
+        return {"detections": detections}
+    
+    except Exception as e:
+        logger.warning(f"YOLO detection error: {e}")
+        return {"detections": []}
+
+# ──────────────────────────────────────────────────────────────────────────────
 def generate_random_detections() -> Dict[str, Any]:
     """Generate random bounding box detections - MATCHES HOLOLENS CLIENT FORMAT EXACTLY"""
     detections = []
@@ -108,18 +201,22 @@ async def ai_detection_ws_handler(websocket):
             detection_task.cancel()
 
 async def send_random_detections(websocket):
-    """Send random detection results to HoloLens every few seconds"""
+    """Send AI detection results (YOLO-World) to HoloLens"""
     try:
         while True:
-            await asyncio.sleep(2.0)
-            detection_result = generate_random_detections()
+            await asyncio.sleep(0.5)  # Faster updates for real-time detection (2 FPS)
             
-            # Use separators to remove ALL spaces from JSON
-            json_str = json.dumps(detection_result, separators=(',', ':'))
+            # Use YOLO-World for real detection (falls back to random if model not loaded)
+            detection_result = run_yolo_detection()
             
-            logger.info(f"Sending detection to HoloLens: {json_str}")
-            await websocket.send(json_str)  # text message
-            logger.info(f"Sent {len(detection_result['detections'])} random detections to HoloLens")
+            # Only send if we have detections
+            if detection_result["detections"]:
+                # Use separators to remove ALL spaces from JSON
+                json_str = json.dumps(detection_result, separators=(',', ':'))
+                
+                logger.info(f"Sending detection to HoloLens: {json_str}")
+                await websocket.send(json_str)  # text message
+                logger.info(f"Sent {len(detection_result['detections'])} detection(s) to HoloLens")
     except asyncio.CancelledError:
         logger.info("Detection sending task cancelled")
     except Exception as e:
@@ -388,7 +485,15 @@ def tcp_loop(loop: asyncio.AbstractEventLoop):
                             h, w = img_size  # img_size is (H, W)
                             bgra = np.frombuffer(bgra_data, dtype=np.uint8).reshape((h, w, 4))
 
-                            # Drop alpha and copy for OpenCV
+                            # Convert BGRA to RGB for YOLO-World processing
+                            rgb = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGB)
+                            
+                            # Update latest frame for YOLO detection
+                            global latest_frame
+                            with latest_frame_lock:
+                                latest_frame = rgb
+
+                            # Drop alpha and copy for OpenCV display
                             bgr = bgra[:, :, :3].copy()
 
                             # ✅ Writable now, rectangle works
@@ -447,6 +552,10 @@ async def main():
     logger.info("Starting HoloLens AI Detection Server")
 
     loop = asyncio.get_running_loop()
+    
+    # Initialize YOLO-World model in a separate thread to avoid blocking
+    logger.info("Initializing YOLO-World model...")
+    await loop.run_in_executor(None, init_yolo_world)
 
     json_server = await websockets.serve(
         json_ws_handler, WS_JSON[0], WS_JSON[1],
