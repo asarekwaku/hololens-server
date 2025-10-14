@@ -113,8 +113,8 @@ async def send_random_detections(websocket):
         while True:
             await asyncio.sleep(2.0)
             detection_result = generate_random_detections()
-            json_str = json.dumps(detection_result, indent=2)
-            logger.info(f"Sending detection to HoloLens:\n{json_str}")
+            json_str = json.dumps(detection_result)
+            logger.info(f"Sending detection to HoloLens: {json_str}")
             await websocket.send(json_str)  # text message
             logger.info(f"Sent {len(detection_result['detections'])} random detections to HoloLens")
     except asyncio.CancelledError:
