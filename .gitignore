@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# YOLO model weights (large files)
+*.pt
+
+# Log files
+*.log
+
+# Diagnostic frames
+hl_diagnostics/
+
+# Virtual environment
+venv/
+env/
+
