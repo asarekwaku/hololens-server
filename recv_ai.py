@@ -113,7 +113,10 @@ async def send_random_detections(websocket):
         while True:
             await asyncio.sleep(2.0)
             detection_result = generate_random_detections()
-            json_str = json.dumps(detection_result)
+            
+            # Use separators to remove ALL spaces from JSON
+            json_str = json.dumps(detection_result, separators=(',', ':'))
+            
             logger.info(f"Sending detection to HoloLens: {json_str}")
             await websocket.send(json_str)  # text message
             logger.info(f"Sent {len(detection_result['detections'])} random detections to HoloLens")
