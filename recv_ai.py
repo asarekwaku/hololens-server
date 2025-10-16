@@ -134,8 +134,8 @@ def run_yolo_detection() -> Dict[str, Any]:
                 box = boxes.xyxy[i].cpu().numpy()  # [x1, y1, x2, y2]
                 conf = float(boxes.conf[i].cpu().numpy())
                 
-                # Convert to normalized coordinates (0-1)
-                x1, y1, x2, y2 = box
+                # Convert to normalized coordinates (0-1) - convert to Python floats
+                x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
                 x = x1 / w
                 y = y1 / h
                 width = (x2 - x1) / w
@@ -483,7 +483,8 @@ def tcp_loop(loop: asyncio.AbstractEventLoop):
                     if decode_success:
                         try:
                             h, w = img_size  # img_size is (H, W)
-                            bgra = np.frombuffer(bgra_data, dtype=np.uint8).reshape((h, w, 4))
+                            # Create writable copy from the start
+                            bgra = np.frombuffer(bgra_data, dtype=np.uint8).reshape((h, w, 4)).copy()
 
                             # Convert BGRA to RGB for YOLO-World processing
                             rgb = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGB)
@@ -499,7 +500,7 @@ def tcp_loop(loop: asyncio.AbstractEventLoop):
                             # ✅ Writable now, rectangle works
                             cv2.rectangle(bgr, (w // 4, h // 4), (3 * w // 4, 3 * h // 4), (0, 255, 0), 4)
 
-                            # Show live stream window
+                            # Show live stream window (may cause warnings on macOS due to threading)
                             cv2.imshow("HoloLens Stream", bgr)
                             if cv2.waitKey(1) & 0xFF == ord('q'):
                                 logger.info("User pressed 'q' – closing OpenCV window")
