@@ -1,4 +1,9 @@
-import asyncio, socket, struct, time, os, json, logging, random
+# OPTIMIZED HoloLens Server - 3-Thread Architecture
+# Thread 1: TCP Reception (FAST - no blocking)
+# Thread 2: YOLO Detection (async, runs at 30 FPS for responsive boxes)
+# Thread 3: OpenCV Display (separate, doesn't block reception)
+
+import asyncio, socket, struct, time, os, json, logging
 import cv2, numpy as np
 import websockets
 from datetime import datetime
@@ -6,90 +11,58 @@ from typing import Optional, Dict, Any
 from ultralytics import YOLO
 from pathlib import Path
 import threading
+import concurrent.futures
+from collections import deque
+import queue
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Server configuration - MATCHES HOLOLENS CLIENT
-LISTEN_TCP = ('0.0.0.0', 8080)        # HL -> PC frames (changed from 8766)
-WS_JSON    = ('0.0.0.0', 8770)        # PC -> HL JSON
-WS_VIDEO   = ('0.0.0.0', 8771)        # PC -> HL binary (jpg/png/rgba bytes)
-WS_AI_DETECTION = ('0.0.0.0', 8772)   # AI Detection WebSocket (bidirectional)
+# Server configuration
+LISTEN_TCP = ('0.0.0.0', 8080)
+WS_AI_DETECTION = ('0.0.0.0', 8772)
+MAX_FRAME_SIZE = 10_000_000
+MIN_FRAME_SIZE = 1_000
+MAX_FRAME_ID = 1_000_000
 
-# Limits and safety
-MAX_FRAME_SIZE   = 10_000_000  # 10MB max frame
-MIN_FRAME_SIZE   = 1_000       # 1KB min frame
-STATS_INTERVAL   = 2.0         # seconds
-MAX_FRAME_ID     = 1_000_000   # Reset frame counter at this point
+# Thread-safe queues
+display_queue = queue.Queue(maxsize=2)  # For OpenCV display (drop if full)
+detection_frame_queue = deque(maxlen=1)  # For YOLO (only keep latest)
+detection_frame_lock = threading.Lock()
 
-# Global client sets
-json_clients = set()
-video_clients = set()
+# Global state
 ai_detection_clients = set()
-
-# YOLO-World global variables
 yolo_model = None
-target_object = "person"  # default object to detect
-latest_frame = None
-latest_frame_lock = threading.Lock()
+target_object = "person"
+latest_depth_frame = None
+latest_depth_lock = threading.Lock()
+last_detections = []
 
-# Setup logging
+# Logging setup
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # INFO level for performance (use DEBUG if diagnosing issues)
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.FileHandler('hl_server.log'), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
-class FrameStats:
-    """Track frame reception statistics"""
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.start_time = time.time()
-        self.frame_count = 0
-        self.bytes_received = 0
-        self.decode_errors = 0
-        self.last_size = (0, 0)
-
-    def update(self, frame_size: int, decode_success: bool, img_size: tuple = (0, 0)):
-        self.frame_count += 1
-        self.bytes_received += frame_size
-        if not decode_success:
-            self.decode_errors += 1
-        if decode_success:
-            self.last_size = img_size
-
-    def get_rates(self) -> Dict[str, float]:
-        elapsed = time.time() - self.start_time
-        if elapsed == 0:
-            return {"fps": 0, "mbps": 0, "decode_error_rate": 0}
-        fps = self.frame_count / elapsed
-        mbps = (self.bytes_received * 8) / elapsed / 1e6
-        error_rate = self.decode_errors / self.frame_count if self.frame_count > 0 else 0
-        return {
-            "fps": fps,
-            "mbps": mbps,
-            "decode_error_rate": error_rate,
-            "total_frames": self.frame_count,
-            "avg_frame_size": self.bytes_received / self.frame_count if self.frame_count > 0 else 0,
-        }
-
-# ──────────────────────────────────────────────────────────────────────────────
 def init_yolo_world():
-    """Initialize YOLO-World model for zero-shot detection"""
+    """Initialize YOLO model"""
     global yolo_model, target_object
     try:
-        logger.info("Loading YOLO-World model...")
-        yolo_model = YOLO('yolov8s-world.pt')  # Download and load model
-        yolo_model.set_classes([target_object])  # Set initial target class
-        logger.info(f"YOLO-World model loaded successfully! Detecting: {target_object}")
+        logger.info("Loading YOLO model...")
+        try:
+            yolo_model = YOLO('yolov8n-world.pt')
+            logger.info("✅ Using YOLOv8n (nano) - fast mode!")
+        except:
+            yolo_model = YOLO('yolov8s-world.pt')
+            logger.info("✅ Using YOLOv8s (small)")
+        
+        yolo_model.set_classes([target_object])
+        logger.info(f"🎯 Detecting: {target_object}")
     except Exception as e:
-        logger.error(f"Failed to load YOLO-World model: {e}")
-        logger.error("Will fall back to random detections")
+        logger.error(f"❌ Failed to load YOLO: {e}")
 
 def read_target_object():
-    """Read target object from text file"""
+    """Read target from file"""
     global target_object, yolo_model
     try:
         target_file = Path("target_object.txt")
@@ -97,49 +70,47 @@ def read_target_object():
             new_target = target_file.read_text().strip()
             if new_target and new_target != target_object:
                 target_object = new_target
-                logger.info(f"Target object updated to: {target_object}")
-                # Update YOLO-World classes
                 if yolo_model:
                     yolo_model.set_classes([target_object])
-                    logger.info(f"YOLO-World now detecting: {target_object}")
+                logger.info(f"🎯 Target updated: {target_object}")
     except Exception as e:
-        logger.warning(f"Error reading target object file: {e}")
+        logger.warning(f"Error reading target: {e}")
 
-def run_yolo_detection() -> Dict[str, Any]:
-    """Run YOLO-World detection on latest frame from HoloLens"""
-    global latest_frame, yolo_model, target_object
+def run_yolo_detection_on_frame(frame: np.ndarray) -> Dict[str, Any]:
+    """Run YOLO on a single frame (called from detection thread)"""
+    global yolo_model, target_object
     
-    # Fallback to random detections if model not loaded or no frame available
-    if yolo_model is None or latest_frame is None:
-        return generate_random_detections()
+    if yolo_model is None or frame is None:
+        return {"detections": []}
     
     try:
-        # Read target object from file (check for updates)
         read_target_object()
         
-        # Run inference on the latest frame
-        with latest_frame_lock:
-            if latest_frame is None:
-                return {"detections": []}
-            frame = latest_frame.copy()
+        h, w = frame.shape[:2]
+        logger.debug(f"🔍 Processing frame: {w}×{h}")
         
-        results = yolo_model(frame, verbose=False, conf=0.3)  # 30% confidence threshold
+        # OPTIMIZATION: Run YOLO at native resolution with optimized settings
+        # Lower imgsz for faster inference, lower conf for more detections
+        results = yolo_model(frame, verbose=False, conf=0.25, imgsz=416, half=False)
         
         detections = []
         if len(results) > 0 and results[0].boxes is not None:
             boxes = results[0].boxes
-            h, w = frame.shape[:2]
             
             for i in range(len(boxes)):
-                box = boxes.xyxy[i].cpu().numpy()  # [x1, y1, x2, y2]
+                box = boxes.xyxy[i].cpu().numpy()
                 conf = float(boxes.conf[i].cpu().numpy())
                 
-                # Convert to normalized coordinates (0-1) - convert to Python floats
+                # Get pixel coordinates
                 x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+                
+                # Normalize to 0-1 range
                 x = x1 / w
                 y = y1 / h
                 width = (x2 - x1) / w
                 height = (y2 - y1) / h
+                
+                logger.debug(f"📦 Detection: pixel=({x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}) norm=({x:.3f},{y:.3f},{width:.3f},{height:.3f}) conf={conf:.3f}")
                 
                 detections.append({
                     "class": target_object,
@@ -152,454 +123,374 @@ def run_yolo_detection() -> Dict[str, Any]:
                     }
                 })
         
-        logger.debug(f"YOLO detected {len(detections)} {target_object}(s)")
+        logger.debug(f"✅ Found {len(detections)} detection(s)")
         return {"detections": detections}
     
     except Exception as e:
-        logger.warning(f"YOLO detection error: {e}")
+        logger.warning(f"YOLO error: {e}")
         return {"detections": []}
 
-# ──────────────────────────────────────────────────────────────────────────────
-def generate_random_detections() -> Dict[str, Any]:
-    """Generate random bounding box detections - MATCHES HOLOLENS CLIENT FORMAT EXACTLY"""
-    detections = []
-    num_detections = random.randint(1, 3)
-    for _ in range(num_detections):
-        x = random.uniform(0.1, 0.6)
-        y = random.uniform(0.1, 0.6)
-        width  = random.uniform(0.1, 0.3)
-        height = random.uniform(0.1, 0.4)
-        if x + width > 1.0:  width  = 1.0 - x
-        if y + height > 1.0: height = 1.0 - y
-        detections.append({
-            "class": random.choice(["person", "car", "dog", "cat", "bottle"]),
-            "confidence": round(random.uniform(0.7, 0.95), 3),
-            "bbox": {"x": round(x, 3), "y": round(y, 3), "width": round(width, 3), "height": round(height, 3)},
-        })
-    return {"detections":detections}
+def get_depth_at_detection(detection, depth_frame, rgb_width, rgb_height):
+    """Get depth value at detection center"""
+    if depth_frame is None:
+        return None
+    
+    depth_h, depth_w = depth_frame.shape
+    bbox = detection['bbox']
+    center_norm_x = bbox['x'] + bbox['width'] / 2.0
+    center_norm_y = bbox['y'] + bbox['height'] / 2.0
+    
+    depth_x = int(center_norm_x * depth_w)
+    depth_y = int(center_norm_y * depth_h)
+    depth_x = max(0, min(depth_x, depth_w - 1))
+    depth_y = max(0, min(depth_y, depth_h - 1))
+    
+    depth_mm = depth_frame[depth_y, depth_x]
+    
+    if depth_mm > 0 and depth_mm < 10000:
+        return depth_mm / 1000.0
+    
+    return None
 
-async def ai_detection_ws_handler(websocket):
-    """Handle AI Detection WebSocket connections (bidirectional)"""
-    client_addr = websocket.remote_address
-    logger.info(f"AI DETECTION WS connected: {client_addr}")
-    ai_detection_clients.add(websocket)
-    try:
-        detection_task = asyncio.create_task(send_random_detections(websocket))
-        async for message in websocket:
-            if isinstance(message, bytes):
-                await handle_ai_video_frame(message, websocket)
-            else:
-                logger.debug(f"AI Detection JSON from {client_addr}: {message[:100]}")
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"AI DETECTION WS client {client_addr} disconnected normally")
-    except Exception as e:
-        logger.warning(f"AI DETECTION WS client {client_addr} error: {e}")
-    finally:
-        ai_detection_clients.discard(websocket)
-        logger.info(f"AI DETECTION WS client {client_addr} removed")
-        if 'detection_task' in locals():
-            detection_task.cancel()
-
-async def send_random_detections(websocket):
-    """Send AI detection results (YOLO-World) to HoloLens"""
-    try:
-        while True:
-            await asyncio.sleep(0.5)  # Faster updates for real-time detection (2 FPS)
-            
-            # Use YOLO-World for real detection (falls back to random if model not loaded)
-            detection_result = run_yolo_detection()
-            
-            # Only send if we have detections
-            if detection_result["detections"]:
-                # Use separators to remove ALL spaces from JSON
-                json_str = json.dumps(detection_result, separators=(',', ':'))
-                
-                logger.info(f"Sending detection to HoloLens: {json_str}")
-                await websocket.send(json_str)  # text message
-                logger.info(f"Sent {len(detection_result['detections'])} detection(s) to HoloLens")
-    except asyncio.CancelledError:
-        logger.info("Detection sending task cancelled")
-    except Exception as e:
-        logger.warning(f"Error sending detections: {e}")
-
-async def handle_ai_video_frame(frame_data: bytes, websocket):
-    """Process video frame received from HoloLens for AI detection"""
-    try:
-        if len(frame_data) < 16:
-            logger.warning(f"AI frame too small: {len(frame_data)} bytes")
-            return
-        frame_id, width, height, data_size = struct.unpack('!IIII', frame_data[:16])
-        if data_size != len(frame_data) - 16:
-            logger.warning(f"AI frame size mismatch: expected {data_size}, got {len(frame_data) - 16}")
-            return
-        if width <= 0 or height <= 0 or width > 4096 or height > 4096:
-            logger.warning(f"AI frame invalid dimensions: {width}x{height}")
-            return
-        bgra_bytes = frame_data[16:]
-        expected_size = width * height * 4
-        if len(bgra_bytes) != expected_size:
-            logger.warning(f"AI frame data size mismatch: expected {expected_size}, got {len(bgra_bytes)}")
-            return
-        logger.debug(f"Received AI video frame: {frame_id}, {width}x{height}, {len(bgra_bytes)} bytes")
-    except Exception as e:
-        logger.warning(f"Error processing AI video frame: {e}")
-
-async def json_ws_handler(websocket):
-    """Handle JSON WebSocket connections"""
-    client_addr = websocket.remote_address
-    logger.info(f"JSON WS connected: {client_addr}")
-    json_clients.add(websocket)
-    try:
-        async for message in websocket:
-            logger.debug(f"Received JSON message from {client_addr}: {message[:100]}")
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"JSON WS client {client_addr} disconnected normally")
-    except Exception as e:
-        logger.warning(f"JSON WS client {client_addr} error: {e}")
-    finally:
-        json_clients.discard(websocket)
-        logger.info(f"JSON WS client {client_addr} removed")
-
-async def video_ws_handler(websocket):
-    """Handle video WebSocket connections - send fake green video frames"""
-    client_addr = websocket.remote_address
-    logger.info(f"VIDEO WS connected: {client_addr}")
-    video_clients.add(websocket)
-    try:
-        while True:
-            frame = np.zeros((256, 256, 4), dtype=np.uint8)
-            frame[:, :, 1] = 255   # Green
-            frame[:, :, 3] = 255   # Alpha
-            await websocket.send(frame.tobytes())
-            await asyncio.sleep(0.05)  # 20 fps
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"VIDEO WS client {client_addr} disconnected normally")
-    finally:
-        video_clients.discard(websocket)
-
-async def ws_json_broadcast(payload: Dict[str, Any]):
-    """Broadcast JSON data to all JSON WebSocket clients"""
-    if not json_clients:
-        return
-    data = json.dumps(payload, default=str)
-    dead = []
-    for ws in list(json_clients):
-        try:
-            await ws.send(data)
-        except websockets.exceptions.ConnectionClosed:
-            dead.append(ws)
-        except Exception as e:
-            logger.warning(f"JSON broadcast error to {ws.remote_address}: {e}")
-            dead.append(ws)
-    for ws in dead:
-        json_clients.discard(ws)
-
-async def ws_video_broadcast(binary: bytes):
-    """Broadcast binary video data to all video WebSocket clients"""
-    if not video_clients:
-        return
-    dead = []
-    for ws in list(video_clients):
-        try:
-            await ws.send(binary)
-        except websockets.exceptions.ConnectionClosed:
-            dead.append(ws)
-        except Exception as e:
-            logger.warning(f"VIDEO broadcast error to {ws.remote_address}: {e}")
-            dead.append(ws)
-    for ws in dead:
-        video_clients.discard(ws)
+def detections_changed(new_dets, old_dets, threshold=0.02):
+    """Check if detections changed significantly (lower threshold for faster updates)"""
+    if len(new_dets) != len(old_dets):
+        return True
+    for new, old in zip(new_dets, old_dets):
+        if abs(new['bbox']['x'] - old['bbox']['x']) > threshold:
+            return True
+        if abs(new['bbox']['y'] - old['bbox']['y']) > threshold:
+            return True
+        if abs(new['bbox']['width'] - old['bbox']['width']) > threshold:
+            return True
+        if abs(new['bbox']['height'] - old['bbox']['height']) > threshold:
+            return True
+    return False
 
 # ──────────────────────────────────────────────────────────────────────────────
+# THREAD 1: TCP Reception (FAST - no blocking!)
+# ──────────────────────────────────────────────────────────────────────────────
+
 def read_exact(sock: socket.socket, n: int) -> Optional[bytes]:
-    """Read exactly n bytes from socket or return None if connection lost"""
+    """Read exactly n bytes"""
     if n <= 0:
         return None
     buf = bytearray()
     start_time = time.time()
     while len(buf) < n:
         if time.time() - start_time > 10.0:
-            logger.warning(f"Socket read timeout after 10s, wanted {n} bytes, got {len(buf)}")
             return None
         try:
             remaining = n - len(buf)
             chunk = sock.recv(min(remaining, 65536))
             if not chunk:
-                logger.info(f"Socket closed during read, got {len(buf)}/{n} bytes")
                 return None
             buf.extend(chunk)
-        except socket.timeout:
-            logger.warning("Socket timeout during read")
-            return None
         except Exception as e:
             logger.warning(f"Socket read error: {e}")
             return None
     return bytes(buf)
 
-# ──────────────────────────────────────────────────────────────────────────────
-def validate_and_decode_frame(bgra_data: bytes, width: int, height: int) -> tuple[bool, tuple[int, int]]:
-    """
-    Validate BGRA data and return (success, (H, W)).
-    NOTE: HoloLens sends BGRA (B,G,R,A) bytes.
-    """
-    try:
-        expected_size = width * height * 4
-        if len(bgra_data) != expected_size:
-            return False, (0, 0)
-        # Try a cheap reshape to ensure it’s well-formed
-        _ = np.frombuffer(bgra_data, dtype=np.uint8).reshape((height, width, 4))
-        return True, (height, width)  # return (H, W) so later `h, w = img_size` works
-    except Exception as e:
-        logger.debug(f"Frame decode error: {e}")
-        return False, (0, 0)
-
-# ... [imports and other code remain unchanged above]
-
-def save_diagnostic_frame(bgra_data: bytes, width: int, height: int, frame_id: int, is_first: bool = False):
-    """Save frame for diagnostic purposes (treat input as BGRA)."""
-    try:
-        os.makedirs("hl_diagnostics", exist_ok=True)
-        bgra = np.frombuffer(bgra_data, dtype=np.uint8).reshape((height, width, 4))
-        # Writable copy for OpenCV
-        bgr = cv2.cvtColor(bgra.copy(), cv2.COLOR_BGRA2BGR)
-
-        if is_first:
-            filepath = "hl_diagnostics/first_frame.jpg"
-            cv2.imwrite(filepath, bgr)
-            logger.info(f"Saved first frame: {filepath} ({len(bgra_data)} bytes)")
-
-        if frame_id % 100 == 0:
-            filepath = f"hl_diagnostics/frame_{frame_id:06d}.jpg"
-            cv2.imwrite(filepath, bgr)
-            logger.debug(f"Saved diagnostic frame: {filepath}")
-    except Exception as e:
-        logger.warning(f"Failed to save diagnostic frame: {e}")
-
-
-def tcp_loop(loop: asyncio.AbstractEventLoop):
-    """Main TCP receiver loop - MATCHES HOLOLENS CLIENT FORMAT"""
-    logger.info("Starting TCP receiver thread")
-
-    os.makedirs("hl_diagnostics", exist_ok=True)
+def tcp_reception_thread():
+    """OPTIMIZED: TCP reception - NO BLOCKING operations!"""
+    logger.info("🚀 TCP reception thread started")
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind(LISTEN_TCP)
     server_sock.listen(1)
-
-    logger.info(f"TCP listening on {LISTEN_TCP}")
-    logger.info(f"JSON WebSocket on ws://{WS_JSON[0]}:{WS_JSON[1]}")
-    logger.info(f"VIDEO WebSocket on ws://{WS_VIDEO[0]}:{WS_VIDEO[1]}")
-    logger.info(f"AI DETECTION WebSocket on ws://{WS_AI_DETECTION[0]}:{WS_AI_DETECTION[1]}")
+    logger.info(f"📡 TCP listening on {LISTEN_TCP}")
 
     while True:
         try:
             conn, addr = server_sock.accept()
-            logger.info(f"HoloLens connected from {addr}")
+            logger.info(f"✅ HoloLens connected: {addr}")
 
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             conn.settimeout(15.0)
 
-            stats = FrameStats()
-            frame_id = 0
-            first_frame_saved = False
-            connection_start = datetime.now()
+            frame_count = 0
+            fps_timer = time.time()
+            fps_count = 0
 
             try:
                 while True:
                     # Read header length
                     header_length_data = read_exact(conn, 4)
-                    if header_length_data is None:
-                        logger.info("Connection closed (no header length)")
+                    if not header_length_data:
                         break
 
                     header_length = struct.unpack("!I", header_length_data)[0]
                     if header_length < 10 or header_length > 1000:
-                        logger.warning(f"Invalid header length: {header_length}, skipping")
                         continue
 
                     # Read JSON header
                     header_data = read_exact(conn, header_length)
-                    if header_data is None:
-                        logger.warning(f"Failed to read header ({header_length} bytes)")
+                    if not header_data:
                         break
 
-                    try:
-                        header_json = json.loads(header_data.decode('utf-8'))
-                        width     = header_json.get('width', 0)
-                        height    = header_json.get('height', 0)
-                        data_size = header_json.get('dataSize', 0)
-                        timestamp = header_json.get('timestamp', 0)
-                        logger.debug(f"Received frame header: {width}x{height}, {data_size} bytes, ts={timestamp}")
-                    except Exception as e:
-                        logger.warning(f"Failed to parse JSON header: {e}")
-                        continue
+                    header = json.loads(header_data.decode('utf-8'))
+                    width = header.get('width', 0)
+                    height = header.get('height', 0)
+                    data_size = header.get('dataSize', 0)
+                    has_depth = header.get('hasDepth', False)
+                    depth_data_size = header.get('depthDataSize', 0)
+                    depth_width = header.get('depthWidth', 0)
+                    depth_height = header.get('depthHeight', 0)
 
                     if data_size < MIN_FRAME_SIZE or data_size > MAX_FRAME_SIZE:
-                        logger.warning(f"Invalid frame data size: {data_size}")
                         continue
 
-                    # Read BGRA payload
-                    bgra_data = read_exact(conn, data_size)
-                    if bgra_data is None:
-                        logger.warning(f"Failed to read frame data ({data_size} bytes)")
+                    # Read RGBA data
+                    rgba_data = read_exact(conn, data_size)
+                    if not rgba_data:
                         break
 
-                    frame_id += 1
-                    if frame_id > MAX_FRAME_ID:
-                        frame_id = 1
-
-                    decode_success, img_size = validate_and_decode_frame(bgra_data, width, height)
-                    stats.update(data_size, decode_success, img_size)
-
-                    if not first_frame_saved:
-                        save_diagnostic_frame(bgra_data, width, height, frame_id, is_first=True)
-                        first_frame_saved = True
-                    if frame_id % 100 == 0:
-                        save_diagnostic_frame(bgra_data, width, height, frame_id)
-
-                    payload = {
-                        "frame_id": frame_id,
-                        "size": list(img_size),  # [H, W]
-                        "frame_bytes": data_size,
-                        "decode_success": decode_success,
-                        "timestamp": datetime.now().isoformat(),
-                        "connection_duration": (datetime.now() - connection_start).total_seconds(),
-                    }
-
-                    if time.time() - stats.start_time >= STATS_INTERVAL:
-                        rates = stats.get_rates()
-                        payload.update(rates)
-                        logger.info(
-                            f"Stats: {rates['fps']:.1f} fps, "
-                            f"{rates['mbps']:.2f} Mbps, "
-                            f"Size(HxW): {img_size}, "
-                            f"Avg frame: {rates['avg_frame_size']:.0f}B, "
-                            f"Errors: {rates['decode_error_rate']:.1%}"
-                        )
-                        stats.reset()
-
-                    # If valid, display and broadcast
-                    if decode_success:
-                        try:
-                            h, w = img_size  # img_size is (H, W)
-                            # Create writable copy from the start
-                            bgra = np.frombuffer(bgra_data, dtype=np.uint8).reshape((h, w, 4)).copy()
-
-                            # Convert BGRA to RGB for YOLO-World processing
-                            rgb = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGB)
-                            
-                            # Update latest frame for YOLO detection
-                            global latest_frame
-                            with latest_frame_lock:
-                                latest_frame = rgb
-
-                            # Drop alpha and copy for OpenCV display
-                            bgr = bgra[:, :, :3].copy()
-
-                            # ✅ Writable now, rectangle works
-                            cv2.rectangle(bgr, (w // 4, h // 4), (3 * w // 4, 3 * h // 4), (0, 255, 0), 4)
-
-                            # Show live stream window (may cause warnings on macOS due to threading)
-                            cv2.imshow("HoloLens Stream", bgr)
-                            if cv2.waitKey(1) & 0xFF == ord('q'):
-                                logger.info("User pressed 'q' – closing OpenCV window")
-                                cv2.destroyAllWindows()
-                                conn.close()
-                                return  # exit tcp_loop
-
-                            # Convert BGR -> RGBA for broadcasting
-                            rgba = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGBA)
-                            out_frame = rgba.tobytes()
-
-                        except Exception as e:
-                            logger.warning(f"Box drawing / viewer failed: {e}")
-                            out_frame = bgra_data  # fall back to original bytes
-                    else:
-                        out_frame = bgra_data  # invalid; forward as-is
-
-                    # Broadcast telemetry + video
-                    asyncio.run_coroutine_threadsafe(ws_json_broadcast(payload), loop)
-                    asyncio.run_coroutine_threadsafe(ws_video_broadcast(out_frame), loop)
-
+                    # Read depth data if present
+                    if has_depth and depth_data_size > 0:
+                        depth_bytes = read_exact(conn, depth_data_size)
+                        if depth_bytes:
+                            depth_frame = np.frombuffer(depth_bytes, dtype=np.uint16).reshape((depth_height, depth_width))
+                            with latest_depth_lock:
+                                global latest_depth_frame
+                                latest_depth_frame = depth_frame
+                    
+                    frame_count += 1
+                    fps_count += 1
+                    
+                    # Convert to numpy (FAST operation)
+                    rgba = np.frombuffer(rgba_data, dtype=np.uint8).reshape((height, width, 4))
+                    rgb = cv2.cvtColor(rgba, cv2.COLOR_RGBA2RGB)
+                    
+                    # Validate frame dimensions on first frame
+                    if frame_count == 1:
+                        logger.info(f"📐 First frame resolution: {width}×{height} (expected: 640×360 or 1280×720)")
+                        if width != 640 and width != 1280:
+                            logger.warning(f"⚠️  Unexpected width: {width} (expected 640 or 1280)")
+                        if height != 360 and height != 720:
+                            logger.warning(f"⚠️  Unexpected height: {height} (expected 360 or 720)")
+                    
+                    # Queue for display (non-blocking - drop if full)
+                    try:
+                        display_queue.put_nowait((rgb.copy(), frame_count))
+                    except queue.Full:
+                        pass  # Drop frame if display can't keep up
+                    
+                    # Queue for detection (keep only latest)
+                    with detection_frame_lock:
+                        detection_frame_queue.append(rgb.copy())
+                    
+                    # FPS logging
+                    if time.time() - fps_timer >= 2.0:
+                        fps = fps_count / (time.time() - fps_timer)
+                        logger.info(f"📊 Reception: {fps:.1f} FPS, {width}×{height}, Frame #{frame_count}")
+                        fps_timer = time.time()
+                        fps_count = 0
+            
             except Exception as e:
-                logger.error(f"Error handling connection from {addr}: {e}")
-
+                logger.error(f"❌ Connection error: {e}")
             finally:
-                try:
-                    conn.shutdown(socket.SHUT_RDWR)
-                except:
-                    pass
-                try:
-                    conn.close()
-                except:
-                    pass
-
-                duration = (datetime.now() - connection_start).total_seconds()
-                final_stats = stats.get_rates()
-                logger.info(
-                    f"HoloLens {addr} disconnected after {duration:.1f}s, "
-                    f"processed {final_stats['total_frames']} frames"
-                )
-
+                conn.close()
+                logger.info(f"📴 HoloLens disconnected: {addr}")
+        
         except Exception as e:
-            logger.error(f"TCP server error: {e}")
+            logger.error(f"❌ TCP server error: {e}")
             time.sleep(1)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# THREAD 2: YOLO Detection (runs at ~30 FPS for responsive bounding boxes)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def yolo_detection_loop():
+    """OPTIMIZED: YOLO detection at 20-30 FPS for responsive bounding boxes"""
+    global last_detections
+    logger.info("🔍 YOLO detection loop started")
+    
+    detection_count = 0
+    fps_timer = time.time()
+    
+    while True:
+        try:
+            # Run at 20-30 Hz for fast, responsive bounding boxes
+            await asyncio.sleep(0.033)  # ~30 FPS detection rate
+            
+            # Get latest frame
+            with detection_frame_lock:
+                if len(detection_frame_queue) == 0:
+                    continue
+                frame = detection_frame_queue[-1]
+            
+            # Run YOLO (async)
+            loop = asyncio.get_running_loop()
+            detection_result = await loop.run_in_executor(
+                None, 
+                run_yolo_detection_on_frame, 
+                frame
+            )
+            
+            # Add depth to detections if present
+            if detection_result["detections"]:
+                with latest_depth_lock:
+                    depth_frame = latest_depth_frame
+                
+                for detection in detection_result["detections"]:
+                    if depth_frame is not None:
+                        depth_meters = get_depth_at_detection(
+                            detection, depth_frame, 640, 360
+                        )
+                        detection["depth"] = depth_meters
+                    else:
+                        detection["depth"] = None
+            
+            # Send if changed (INCLUDING when detections become empty!)
+            if detections_changed(detection_result["detections"], last_detections):
+                json_str = json.dumps(detection_result, separators=(',', ':'))
+                
+                logger.info(f"📤 Sending to HoloLens: {json_str}")
+                
+                # Send to all connected HoloLens clients
+                sent_count = 0
+                for websocket in list(ai_detection_clients):
+                    try:
+                        await websocket.send(json_str)
+                        sent_count += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to send to client: {e}")
+                
+                logger.debug(f"✅ Sent to {sent_count} client(s)")
+                
+                detection_count += 1
+                last_detections = detection_result["detections"].copy()  # Clear if empty!
+                
+                # FPS logging
+                if time.time() - fps_timer >= 5.0:
+                    fps = detection_count / (time.time() - fps_timer)
+                    logger.info(f"🎯 Detection: {fps:.1f} FPS, {len(detection_result['detections'])} objects")
+                    fps_timer = time.time()
+                    detection_count = 0
+        
+        except Exception as e:
+            logger.warning(f"Detection loop error: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
+# THREAD 3: OpenCV Display (separate, doesn't block reception)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def opencv_display_thread():
+    """OPTIMIZED: OpenCV display in separate thread"""
+    logger.info("🖥️  OpenCV display thread started")
+    
+    while True:
+        try:
+            # Get frame from queue (blocking with timeout)
+            frame, frame_id = display_queue.get(timeout=1.0)
+            
+            # Convert to BGR for display
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # Get latest detections and draw boxes
+            if last_detections:
+                h, w = bgr.shape[:2]
+                for det in last_detections:
+                    bbox = det["bbox"]
+                    x1 = int(bbox["x"] * w)
+                    y1 = int(bbox["y"] * h)
+                    x2 = int((bbox["x"] + bbox["width"]) * w)
+                    y2 = int((bbox["y"] + bbox["height"]) * h)
+                    
+                    cv2.rectangle(bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    
+                    label = f"{det['class']} {det['confidence']:.2f}"
+                    if det.get('depth'):
+                        label += f" {det['depth']:.2f}m"
+                    
+                    cv2.putText(bgr, label, (x1, y1 - 5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # Display (this blocks, but it's OK - it's in a separate thread!)
+            cv2.imshow("HoloLens Stream", bgr)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                logger.info("User pressed 'q' - closing")
+                break
+        
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logger.warning(f"Display error: {e}")
+    
+    cv2.destroyAllWindows()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WebSocket Handler
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def ai_detection_ws_handler(websocket):
+    """Handle AI Detection WebSocket"""
+    client_addr = websocket.remote_address
+    logger.info(f"✅ AI Detection client connected: {client_addr}")
+    ai_detection_clients.add(websocket)
+    
+    try:
+        async for message in websocket:
+            pass  # Just keep connection alive
+    except websockets.exceptions.ConnectionClosed:
+        logger.info(f"📴 AI Detection client disconnected: {client_addr}")
+    finally:
+        ai_detection_clients.discard(websocket)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+
 async def main():
     """Main async entry point"""
-    logger.info("Starting HoloLens AI Detection Server")
+    logger.info("🚀 Starting OPTIMIZED HoloLens AI Server")
 
+    # Initialize YOLO
     loop = asyncio.get_running_loop()
-    
-    # Initialize YOLO-World model in a separate thread to avoid blocking
-    logger.info("Initializing YOLO-World model...")
     await loop.run_in_executor(None, init_yolo_world)
 
-    json_server = await websockets.serve(
-        json_ws_handler, WS_JSON[0], WS_JSON[1],
-        ping_interval=20, ping_timeout=10, max_size=16*1024*1024
-    )
-
-    video_server = await websockets.serve(
-        video_ws_handler, WS_VIDEO[0], WS_VIDEO[1],
-        ping_interval=20, ping_timeout=10, max_size=16*1024*1024
-    )
-
+    # Start WebSocket server
     ai_detection_server = await websockets.serve(
-        ai_detection_ws_handler, WS_AI_DETECTION[0], WS_AI_DETECTION[1],
-        ping_interval=20, ping_timeout=10, max_size=16*1024*1024
+        ai_detection_ws_handler, 
+        WS_AI_DETECTION[0], 
+        WS_AI_DETECTION[1],
+        ping_interval=20, 
+        ping_timeout=10, 
+        max_size=16*1024*1024
     )
-
-    logger.info("WebSocket servers started")
-    logger.info(f"AI Detection ready on ws://{WS_AI_DETECTION[0]}:{WS_AI_DETECTION[1]}")
-
-    import threading
-    tcp_thread = threading.Thread(target=tcp_loop, args=(loop,), daemon=True)
+    logger.info(f"✅ WebSocket on ws://{WS_AI_DETECTION[0]}:{WS_AI_DETECTION[1]}")
+    
+    # Start TCP reception thread
+    tcp_thread = threading.Thread(target=tcp_reception_thread, daemon=True)
     tcp_thread.start()
-
-    logger.info("Server fully initialized and running")
-    logger.info("Ready to receive frames from HoloLens and send random detections!")
+    logger.info("✅ TCP thread started")
+    
+    # Start OpenCV display thread
+    display_thread = threading.Thread(target=opencv_display_thread, daemon=True)
+    display_thread.start()
+    logger.info("✅ Display thread started")
+    
+    # Start YOLO detection loop
+    detection_task = asyncio.create_task(yolo_detection_loop())
+    logger.info("✅ Detection loop started")
+    
+    logger.info("✅ Server fully operational!")
 
     try:
         await asyncio.Future()
     except KeyboardInterrupt:
-        logger.info("Shutting down server...")
+        logger.info("🛑 Shutting down...")
     finally:
-        json_server.close()
-        video_server.close()
+        detection_task.cancel()
         ai_detection_server.close()
-        await json_server.wait_closed()
-        await video_server.wait_closed()
         await ai_detection_server.wait_closed()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nServer stopped by user")
+        print("\n🛑 Server stopped")
     except Exception as e:
-        logger.critical(f"Server crashed: {e}")
+        logger.critical(f"❌ Server crashed: {e}")
         raise
